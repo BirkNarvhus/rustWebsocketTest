@@ -1,15 +1,13 @@
+use std::vec;
+
 use axum::{Server, Router, routing::get, response::{Html, IntoResponse}, http::Response};
-use tokio::{fs, net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
+use tokio::{fs, net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}, sync::broadcast};
 use sha1::{Sha1, Digest};
 use base64::{Engine as _, engine::general_purpose};
 
 
 #[tokio::main]
 async fn main() {
-    let ix = 256;
-    println!("{}", ix >> 8);
-    println!("{}", ix & 0xff);
-
     let router  = Router::new()
         .route("/", get(get_root))
         .route("/index.js", get(indexjs_get));
@@ -18,6 +16,8 @@ async fn main() {
     let addr = server.local_addr();
     println!("Listening on http://{}", addr);
     
+
+    // server to handel websocket connections
     tokio::spawn(async move {
         create_web_socket().await;
     });
@@ -47,17 +47,51 @@ async fn indexjs_get() -> impl IntoResponse {
 
 async fn create_web_socket() {
     let listener = TcpListener::bind("0.0.0.0:8330").await.unwrap();
-    println!("Listening for webSocket on: {}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap();
+    println!("Listening for webSocket on: {}", addr);
+
+    let (tx, _rx) = broadcast::channel(16);
+    
 
     loop {
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, webs_addr) = listener.accept().await.unwrap();
+
+        let tx = tx.clone();
+        let mut rx = tx.subscribe();
 
         tokio::spawn(async move {
+
             let (mut reader, mut writer) = tokio::io::split(stream);
             setup_web_socket(&mut reader, &mut writer).await;
+            println!("Connection established on: {}", webs_addr);
 
+            let mut buff = [0; 1024];
+            'inner : loop{
+                tokio::select! {
+                    result = reader.read(&mut buff) => {
+                        let res = result.unwrap();
 
-            writer.write_all(&generate_web_socket_message("message from server".to_string())).await.unwrap();
+                        // checks if the opcode is closeing the connection
+                        // and sends the same close connection message back to the client
+                        if is_close_code(&buff[0..res]) {
+                            println!("Connection closed on : {}", webs_addr);
+                            writer.write_all(&buff[0..res]).await.unwrap();
+                            break 'inner;
+                        }
+            
+                        let message = buff[0..res].to_vec();
+                        tx.send((message, webs_addr)).unwrap();
+                    }
+                    result = rx.recv() => {
+                        let (message, rec_addr) = result.unwrap();
+                        if rec_addr != webs_addr {
+                            writer.write_all(&message).await.unwrap();
+
+                        }
+                    }
+                }
+            }
+            
         });
     }
     
@@ -80,7 +114,6 @@ fn get_websocket_key_from_http(buf: &[u8]) -> String {
 // method for setting up the websocket
 
 async fn setup_web_socket(reader: &mut tokio::io::ReadHalf<tokio::net::TcpStream>, writer: &mut tokio::io::WriteHalf<tokio::net::TcpStream>) {
-    // setting up the websocket
     let mut buf = [0; 1024];
     let n = reader.read(&mut buf).await.unwrap();
     if n == 0 {
@@ -91,12 +124,19 @@ async fn setup_web_socket(reader: &mut tokio::io::ReadHalf<tokio::net::TcpStream
     let new_key = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     let generated_key = general_purpose::STANDARD_NO_PAD.encode(&Sha1::digest(new_key));
 
+    // the response to the http request for setting up websocket
     let response = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept:{}=\r\nSec-WebSocket-Protocol: chat\r\n\r\n", generated_key);
 
-    println!("Establishing connection with key {}", generated_key);
 
     writer.write_all(response.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
+}
+
+
+// method for checking opcode of websocket message
+fn is_close_code(message: &[u8]) -> bool {
+    let code = message[0] & 0b00001111;
+    code == 8
 }
 
 
