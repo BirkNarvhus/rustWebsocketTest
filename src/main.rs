@@ -1,10 +1,7 @@
-use std::vec;
-
 use axum::{Server, Router, routing::get, response::{Html, IntoResponse}, http::Response};
 use tokio::{fs, net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}, sync::broadcast};
 use sha1::{Sha1, Digest};
 use base64::{Engine as _, engine::general_purpose};
-
 
 #[tokio::main]
 async fn main() {
@@ -12,7 +9,7 @@ async fn main() {
         .route("/", get(get_root))
         .route("/index.js", get(indexjs_get));
 
-    let server = Server::bind(&"0.0.0.0:7878".parse().unwrap()).serve(router.into_make_service());
+    let server = Server::bind(&"10.0.0.22:7878".parse().unwrap()).serve(router.into_make_service());
     let addr = server.local_addr();
     println!("Listening on http://{}", addr);
     
@@ -46,7 +43,7 @@ async fn indexjs_get() -> impl IntoResponse {
 // create a tcp listner on port 8330 for the websocket
 
 async fn create_web_socket() {
-    let listener = TcpListener::bind("0.0.0.0:8330").await.unwrap();
+    let listener = TcpListener::bind("10.0.0.22:8330").await.unwrap();
     let addr = listener.local_addr().unwrap();
     println!("Listening for webSocket on: {}", addr);
 
@@ -71,21 +68,29 @@ async fn create_web_socket() {
                     result = reader.read(&mut buff) => {
                         let res = result.unwrap();
 
+                        if res == 0 {
+                            continue;
+                        }
+
                         // checks if the opcode is closeing the connection
                         // and sends the same close connection message back to the client
-                        if is_close_code(&buff[0..res]) {
+                        if  is_close_code(&buff[0..res]) {
                             println!("Connection closed on : {}", webs_addr);
                             writer.write_all(&buff[0..res]).await.unwrap();
                             break 'inner;
                         }
-            
-                        let message = buff[0..res].to_vec();
+                        
+
+                        // unmask the message and prints it to the console
+                        let message = unmask_message(&buff[0..res]);
+                    
+                        // sends the unmasked message to all the other clients
                         tx.send((message, webs_addr)).unwrap();
                     }
                     result = rx.recv() => {
                         let (message, rec_addr) = result.unwrap();
                         if rec_addr != webs_addr {
-                            writer.write_all(&message).await.unwrap();
+                            writer.write_all(&generate_web_socket_message(message)).await.unwrap();
 
                         }
                     }
@@ -141,7 +146,7 @@ fn is_close_code(message: &[u8]) -> bool {
 
 
 // metode for generating the websocket message from the server
-fn generate_web_socket_message(message: String) -> Vec<u8> {
+fn generate_web_socket_message(message: Vec<u8>) -> Vec<u8> {
     let mut data = Vec::new();
     data.push(129); // 129 = 81 hex witch means binary 10000001 witch means fin = 1 and opcode = 1 this is for text
     let len = message.len();
@@ -162,6 +167,18 @@ fn generate_web_socket_message(message: String) -> Vec<u8> {
         data.push((len >> 8) as u8);
         data.push((len & 0xff) as u8);
     }
-    data.extend(message.as_bytes());
+    data.extend(message);
+    data
+}
+
+// method for unmasking the websocket message from client
+fn unmask_message(message: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mask = &message[2..6];
+    let mut i = 0;
+    for byte in &message[6..] {
+        data.push(byte ^ mask[i % 4]);
+        i += 1;
+    }
     data
 }
